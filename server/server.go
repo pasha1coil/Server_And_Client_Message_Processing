@@ -9,8 +9,9 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
-	"testingpena/models"
 	"time"
+
+	"github.com/pasha1coil/Server_And_Client_Message_Processing/models"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"

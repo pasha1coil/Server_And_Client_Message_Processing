@@ -8,8 +8,9 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"testingpena/models"
 	"time"
+
+	"github.com/pasha1coil/Server_And_Client_Message_Processing/models"
 
 	"github.com/boltdb/bolt"
 	"github.com/spf13/viper"
