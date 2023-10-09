@@ -1,0 +1,6 @@
+db:
+    Name:   "message.db"
+    Bucket:   "messages"
+test:
+    Name:   "test_messages.db"
+    Bucket:   "test_messages"
