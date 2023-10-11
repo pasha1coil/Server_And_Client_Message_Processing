@@ -309,7 +309,7 @@ func (srv *server) CheckReported() {
 		for count := 0; count < 3; count++ {
 			if len(srv.sentMsgCheck) > 0 {
 				id := srv.sentMsgCheck[0].ID
-				log.Infof("Проверка отчета о msg: %s в бд", id)
+				log.Infof("Проверка отчета о msg: %s", id)
 				if srv.reportedMsgs[id] {
 					srv.sentMsgCheck = srv.sentMsgCheck[1:]
 				} else {
