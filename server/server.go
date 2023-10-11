@@ -32,6 +32,8 @@ type server struct {
 	sentMsgs         map[string]int  //мапа ключ - сообщение, значение - количество попыток
 	sentdoubleMsgs   map[string]bool //мапа чтобы предотвратить отправку одного и того же сообщения клиентам
 	sentdoubleMsgsMu sync.Mutex
+	sentMsgCheck     []*models.Msg
+	sentMsgCheckMu   sync.Mutex
 }
 
 // client структура клиента
@@ -48,6 +50,7 @@ func newServer() (*server, error) {
 	log.Infoln("Создание нового сервера.")
 	if err := initConfig(); err != nil {
 		log.Fatalf("ошибка инициализации конфига: %s", err.Error())
+		return nil, err
 	}
 	db, err := bolt.Open(viper.GetString("db.Name"), 0600, nil) //открываем болт
 	if err != nil {
@@ -116,6 +119,7 @@ func (srv *server) processMessages() {
 					time.Sleep(3 * time.Second)
 					continue
 				}
+				//лочим блок кода чтобы не было условий гонки и только одна горутина имелла доступ в определенный период времени
 				srv.sentdoubleMsgsMu.Lock()
 				// Если сообщение уже было отправлено, увеличиваем счетчик отправок
 				if _, ok := srv.sentMsgs[msg.ID]; ok {
@@ -125,10 +129,12 @@ func (srv *server) processMessages() {
 				}
 
 				if !srv.sentdoubleMsgs[msg.ID] {
+					//берем рандомного клиента из списка
 					client := srv.clients[rand.Intn(len(srv.clients))]
 					log.Infof("Отправка сообщения: %s клиенту: %s", msg.ID, client.ID)
 
 					select {
+					//записываем в канал клиента
 					case client.MsgChan <- msg:
 						srv.sentdoubleMsgs[msg.ID] = true
 					case <-client.disconnect:
@@ -155,7 +161,7 @@ func (srv *server) processMessages() {
 	}
 }
 
-// Сохранение неуспешно отправленных сообщений в bbolt
+// Сохранение неуспешно отправленных сообщений в bolt
 func (srv *server) storeMessage(m *models.Msg) error {
 	err := srv.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(srv.dbBucketName)
@@ -186,22 +192,29 @@ func (srv *server) storeMessage(m *models.Msg) error {
 // sendMessages обрабатывает запросы на /task и отправляет сообщения клиенту
 func (srv *server) sendMessages(w http.ResponseWriter, r *http.Request) {
 	log.Infoln("Получение /task request.")
+
+	// по сути этот блок кода можно убрать, так как он в основном должен использоваться для того чтобы отправлять пакет
+	// сообщений в соответсвии с тем сколько может принять клиент
 	batchSize := 1
 	if q := r.URL.Query().Get("batchsize"); q != "" {
 		fmt.Sscanf(q, "%d", &batchSize)
 	}
+	//
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
+	//определяем основные заголовки для sse
+	w.Header().Set("Content-Type", "text/event-stream") //текст
+	w.Header().Set("Cache-Control", "no-cache")         //без кеша
+	w.Header().Set("Connection", "keep-alive")          //соединение отается открытым для последующих HTTP-запросов
+	w.Header().Set("X-Accel-Buffering", "no")           //без буфферизации
 
+	//определяем flusher для быстрой передачи данных
 	flusher, _ := w.(http.Flusher)
 
-	msgChan := make(chan *models.Msg)
+	// создаем канал коиента и определяем структуру клиента
+	MsgChan := make(chan *models.Msg)
 	client := &client{
 		ID:         generateID(),
-		MsgChan:    msgChan,
+		MsgChan:    MsgChan,
 		disconnect: make(chan bool),
 	}
 
@@ -220,7 +233,9 @@ func (srv *server) sendMessages(w http.ResponseWriter, r *http.Request) {
 
 	log.Infof("Новый клиент %s добавлен.", client.ID)
 
+	//чистим данные клиента после его отключения
 	defer func() {
+		//лочим блок кода чтобы не было условий гонки и только одна горутина имелла доступ в определенный период времени
 		srv.reportedMsgsMu.Lock()
 		delete(srv.reportedMsgs, client.ID)
 		srv.reportedMsgsMu.Unlock()
@@ -228,11 +243,16 @@ func (srv *server) sendMessages(w http.ResponseWriter, r *http.Request) {
 		// перед тем как выйти, отправляем сигнал об отключении
 		client.disconnect <- true
 
+		//заполняем слайс клиентов
 		srv.clients = removeClient(srv.clients, client.ID)
 		close(client.MsgChan)
 	}()
 
-	for msg := range msgChan {
+	//процесс отправки клиенту сообщений по sse
+	for msg := range MsgChan {
+		srv.sentMsgCheck = append(srv.sentMsgCheck, msg)
+		//воркер для проверки репортов
+		go srv.CheckReported()
 		data, err := json.Marshal(msg)
 		if err != nil {
 			log.Infof("Не удалось сериализовать сообщение: %v", err)
@@ -255,6 +275,8 @@ func (srv *server) reportMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	//заполняем инфу о то что пришел отчет о обработанном сообщении
+	//лочим блок кода чтобы не было условий гонки и только одна горутина имелла доступ в определенный период времени
 	srv.reportedMsgsMu.Lock()
 	log.Infof("Отчетное соообщение %s.", id)
 	srv.reportedMsgs[id] = true
@@ -262,6 +284,7 @@ func (srv *server) reportMessage(w http.ResponseWriter, r *http.Request) {
 
 	srv.reportedMsgsMu.Unlock()
 
+	//Успех
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -277,6 +300,38 @@ func removeClient(clients []*client, clientID string) []*client {
 	return result
 }
 
+// воркер для чека репортов, если репорт не получен то данные о msg заносятся в бд
+func (srv *server) CheckReported() {
+	if len(srv.sentMsgCheck) != 0 {
+		srv.sentMsgCheckMu.Lock()
+		defer srv.sentMsgCheckMu.Unlock()
+
+		for count := 0; count < 3; count++ {
+			if len(srv.sentMsgCheck) > 0 {
+				id := srv.sentMsgCheck[0].ID
+				log.Infof("Проверка отчета о msg: %s в бд", id)
+				if srv.reportedMsgs[id] {
+					srv.sentMsgCheck = srv.sentMsgCheck[1:]
+				} else {
+					if count == 2 {
+						log.Infof("Добавление msg: %s в бд", id)
+						err := srv.storeMessage(srv.sentMsgCheck[0])
+						if err != nil {
+							log.Errorf("ошибка добавления msg: %s в бд", id)
+						}
+						srv.sentMsgCheck = srv.sentMsgCheck[1:]
+						break
+					}
+				}
+				time.Sleep(3 * time.Second)
+			} else {
+				count = 0
+				time.Sleep(10 * time.Second)
+			}
+		}
+	}
+}
+
 func main() {
 	log.SetFormatter(new(log.JSONFormatter))
 	log.Infof("Инициализация сервера.")
@@ -285,6 +340,7 @@ func main() {
 		log.Errorf("Ошибка инициализации сервера: %v", err)
 	}
 
+	//воркер который генерит стукртуры Msg
 	go func() {
 		for {
 			period := generateRandomPeriod()
@@ -294,10 +350,11 @@ func main() {
 			}
 			log.Infof("Добавление сообщения %s в очередь", msg.ID)
 			srv.msgQueue <- msg
-			time.Sleep(time.Second) // ждем перед отправкой следующего сообщения
+			time.Sleep(time.Second) // ждем перед генерацией следующего сообщения
 		}
 	}()
 
+	// GracefulShuttdown
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
@@ -308,6 +365,7 @@ func main() {
 		os.Exit(0)
 	}()
 
+	// init routes
 	router := mux.NewRouter()
 	router.HandleFunc("/task", srv.sendMessages).Methods("GET")
 	router.HandleFunc("/report", srv.reportMessage).Methods("POST")
