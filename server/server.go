@@ -210,7 +210,7 @@ func (srv *server) sendMessages(w http.ResponseWriter, r *http.Request) {
 	//определяем flusher для быстрой передачи данных
 	flusher, _ := w.(http.Flusher)
 
-	// создаем канал коиента и определяем структуру клиента
+	// создаем канал клиента и определяем структуру клиента
 	MsgChan := make(chan *models.Msg)
 	client := &client{
 		ID:         generateID(),
@@ -235,10 +235,6 @@ func (srv *server) sendMessages(w http.ResponseWriter, r *http.Request) {
 
 	//чистим данные клиента после его отключения
 	defer func() {
-		//лочим блок кода чтобы не было условий гонки и только одна горутина имелла доступ в определенный период времени
-		srv.reportedMsgsMu.Lock()
-		delete(srv.reportedMsgs, client.ID)
-		srv.reportedMsgsMu.Unlock()
 
 		// перед тем как выйти, отправляем сигнал об отключении
 		client.disconnect <- true
